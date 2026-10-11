@@ -1,15 +1,5 @@
 -- ============================================================================
--- air_strike_2.lua — Kinetic Strike (Bomber-Cam, low-end edition)
---
--- * Compact airbase (about 150 x 110 m) built for low-end devices
--- * ONE C-17, real-world scale (~53 m), split into 10 breakable parts
--- * Soldiers + zombies use Soldier.glb with its Idle / Walk / Run clips
--- * Cannon = hitscan bullets with tracers and impact impulses
---   Missile = physics body (CCD), cylinder visual, billboard smoke trail
--- * Explosions apply mass-independent blast velocities to dynamic bodies
--- * Controls: WASD fly | Q/Space up | Z/Shift down | ARROWS look
---             LMB / F = cannon | RMB / G = missile
---             TAB debug | F1 FX mode | R reset | V cycle POV
+-- air_strike_2.lua — Kinetic Strike (Aircraft Thermal / Heatmap Edition)
 -- ============================================================================
 
 local ROT_IN_DEGREES = true    -- body:getRotation() returns degrees here; draw calls need radians
@@ -24,7 +14,7 @@ local enemies, parts = {}, {}
 local proj_by_id = {}
 local score, wave, wave_timer, banner, banner_t = 0, 0, 1.0, "", 0
 local time_scale, flash_alpha, flash_color = 1.0, 0.0, { 1, 1, 1 }
-local fx_mode, debug_draw = 0, false     -- 0 off (fastest, default), 1 lite, 2 full
+local fx_mode, debug_draw = 2, false     -- default to full FX mode for thermal processing
 local light_t = 0
 local pov, saved_view = 1, { y = 62, pitch = -62, fov = 55 }
 local mcam = { x = 0, y = 0, z = 0, dx = 0, dy = 0, dz = 1, hold = 0 }
@@ -40,11 +30,11 @@ local HX, HZ = 70, 50                    -- half-size of the map
 local ZONE_X, ZONE_Z = 62, 36            -- where enemies may walk
 
 local glitch = { intensity = 0, next_spike = 5, whisper = "", whisper_t = 0, t = 0 }
-local WHISPERS = { "DON'T LOOK AWAY", "IT SEES YOU", "SIGNAL LOST", "WE ARE STILL HERE" }
+local WHISPERS = { "TARGET ACQUIRED", "FLIR_HOT", "LOCK ESTABLISHED", "THERMAL FEED ACTIVE" }
 local hud = { tc = 0, blink = 0, burst = 0, bands = {} }
 
 -- ---------------------------------------------------------------------------
--- Plane definition (offsets/extents measured from top_c17.obj, model units).
+-- Plane definition
 -- ---------------------------------------------------------------------------
 local PLANE_S = 5.0
 local PLANE_X, PLANE_Y, PLANE_Z = 0.0, 1.682 * PLANE_S, 0.0
@@ -61,17 +51,19 @@ local PART_DEFS = {
     { n = "engR2", hp = 110, c = { 3.52,-0.72, 0.52}, h = {0.22,0.25,0.47}, parent = "wingR" },
 }
 
+-- Thermal / Heatmap color scheme: Cold elements are dark/black-blue, hot elements are white-hot/glowing amber
 local COL = {
-    ground = {0.26,0.34,0.22}, asphalt = {0.14,0.14,0.16}, white = {0.94,0.94,0.90},
-    yellow = {0.95,0.85,0.15}, hangar = {0.34,0.42,0.30}, roof = {0.30,0.36,0.26},
-    tower = {0.72,0.75,0.70}, glass = {0.30,0.45,0.55}, tank = {0.90,0.55,0.15},
-    crate = {0.45,0.35,0.22}, barrel = {0.25,0.38,0.25}, scorch = {0.04,0.04,0.04}, plane = {0.72,0.75,0.78, 1.0},
-    cannon = {1.0,0.95,0.4}, missile = {0.82,0.82,0.86}, smoke = {0.35,0.35,0.36},
+    ground = {0.05, 0.08, 0.12}, asphalt = {0.03, 0.05, 0.08}, white = {0.85, 0.90, 0.95},
+    yellow = {0.95, 0.75, 0.20}, hangar = {0.10, 0.14, 0.20}, roof = {0.08, 0.12, 0.18},
+    tower = {0.15, 0.20, 0.28}, glass = {0.20, 0.30, 0.40}, tank = {0.90, 0.45, 0.10}, -- Hot fuel tanks
+    crate = {0.12, 0.16, 0.22}, barrel = {0.15, 0.22, 0.30}, scorch = {0.01, 0.01, 0.02}, 
+    plane = {0.18, 0.24, 0.32, 1.0},
+    cannon = {1.0, 0.95, 0.6}, missile = {0.90, 0.90, 0.95}, smoke = {0.20, 0.25, 0.30},
 }
 
 local WEAPONS = {
     cannon  = { cooldown = 0.07, speed = 260, damage = 7,  spread = 0.010 },
-    missile = { cooldown = 1.1,  radius = 15, force = 300, damage = 230, color = {1.0,0.45,0.1} },
+    missile = { cooldown = 1.1,  radius = 15, force = 300, damage = 230, color = {1.0, 0.5, 0.1} },
 }
 local wtimer = { cannon = 0, missile = 0 }
 local missile_side = 1
@@ -114,9 +106,7 @@ local function spawn_cyl(x, y, z, r, h, motion, dens, color, extra)
     return t
 end
 
--- Effects particles -----------------------------------------------------------
--- kinds: "smoke" (billboard gray), "fire" (additive orange), "spark" (line),
---        "debris" (small cube), "trail" (missile trail; warm->gray billboard)
+-- Effects particles
 local function add_fx(kind, x, y, z, vx, vy, vz, life, size, c)
     if #fx >= MAX_FX then return end
     fx[#fx + 1] = { k = kind, x = x, y = y, z = z, vx = vx, vy = vy, vz = vz,
@@ -170,7 +160,7 @@ local function detach_part(p, ex, ey, ez, strength)
     flash_alpha = math.max(flash_alpha, 0.25); flash_color = { 1, 0.7, 0.3 }
     cam.shake = cam.shake + 0.6
     if p.name:sub(1, 3) == "eng" or p.name == "mid" then
-        trigger_explosion(p.wx, p.wy, p.wz, 7, 60, 0, {1.0, 0.5, 0.1}, 0, nil, true)
+        trigger_explosion(p.wx, p.wy, p.wz, 7, 60, 0, {1.0, 0.6, 0.2}, 0, nil, true)
     end
     for _, c in ipairs(parts) do
         if c.parent == p.name and c.attached then c.pending = rnd(0.05, 0.35) end
@@ -192,7 +182,7 @@ local function plane_left()
 end
 
 -- ---------------------------------------------------------------------------
--- Airbase (compact)
+-- Airbase
 -- ---------------------------------------------------------------------------
 local function build_base()
     crayon.physics3D.destroyAll()
@@ -234,7 +224,7 @@ local function build_base()
 end
 
 -- ---------------------------------------------------------------------------
--- Enemies (Soldier.glb: Idle / Walk / Run)
+-- Enemies (For thermal camera, enemies are rendered extremely hot white/yellow)
 -- ---------------------------------------------------------------------------
 local E_SCALE, E_FOOT, E_ZUP = 1.0, 0.0, false
 
@@ -296,7 +286,7 @@ local function kill_enemy(e, how, dx, dy, dz, power)
     e.life = 7
     score = score + ((e.kind == "zombie") and 150 or 100)
     for _ = 1, 4 do
-        add_fx("spark", e.x, e.y + 1.2, e.z, rnd(-3, 3), rnd(1, 5), rnd(-3, 3), 0.5, 0.12, {0.8, 0.1, 0.1})
+        add_fx("spark", e.x, e.y + 1.2, e.z, rnd(-3, 3), rnd(1, 5), rnd(-3, 3), 0.5, 0.12, {1.0, 0.8, 0.4})
     end
 end
 
@@ -400,11 +390,11 @@ trigger_explosion = function(ex, ey, ez, radius, force, dmg, color, hitstop, fla
     local sp = force * 0.1
     for _ = 1, math.min(16, math.floor(radius * 1.2)) do
         add_fx("spark", ex, ey + 0.4, ez, rnd(-1, 1) * sp, rnd(0.3, 1.2) * sp, rnd(-1, 1) * sp,
-               rnd(0.5, 1.1), 0.1, { 1.0, rnd(0.6, 0.95), rnd(0.2, 0.5) })
+               rnd(0.5, 1.1), 0.1, { 1.0, 0.9, 0.6 })
     end
     for _ = 1, math.min(8, math.floor(radius * 0.7)) do
         add_fx("debris", ex, ey + 0.3, ez, rnd(-1, 1) * sp * 0.7, rnd(0.4, 1.0) * sp * 0.7,
-               rnd(-1, 1) * sp * 0.7, rnd(0.6, 1.4), rnd(0.15, 0.4), { 0.25, 0.22, 0.2 })
+               rnd(-1, 1) * sp * 0.7, rnd(0.6, 1.4), rnd(0.15, 0.4), { 0.15, 0.15, 0.2 })
     end
     for i = 1, math.min(7, math.floor(radius * 0.5) + 2) do
         add_fx("smoke", ex + rnd(-1, 1) * radius * 0.3, ey + rnd(0, 1) * radius * 0.3, ez + rnd(-1, 1) * radius * 0.3,
@@ -426,7 +416,7 @@ trigger_explosion = function(ex, ey, ez, radius, force, dmg, color, hitstop, fla
                         info.hp = info.hp - dmg * fall
                         if info.hp <= 0 and not info.boomed then
                             info.boomed = true
-                            trigger_explosion(bx, by, bz, 11, 200, 120, {1.0, 0.4, 0.05}, 0.12, {1,0.4,0.1})
+                            trigger_explosion(bx, by, bz, 11, 200, 120, {1.0, 0.6, 0.2}, 0.12, {1,0.5,0.2})
                         end
                     end
                     if info.dynamic and body:isValid() then
@@ -470,10 +460,10 @@ local function fire_cannon(hx, hy, hz)
     if enemy then
         endd = et
         kill_enemy(enemy, "shot")
-        add_fx("spark", mx + dx*et, my + dy*et, mz + dz*et, rnd(-2, 2), rnd(1, 4), rnd(-2, 2), 0.4, 0.12, {0.9, 0.1, 0.1})
+        add_fx("spark", mx + dx*et, my + dy*et, mz + dz*et, rnd(-2, 2), rnd(1, 4), rnd(-2, 2), 0.4, 0.12, {1.0, 0.9, 0.6})
     elseif hit then
         for _ = 1, 3 do
-            add_fx("spark", px, py + 0.1, pz, nx * 4 + rnd(-3, 3), ny * 4 + rnd(1, 4), nz * 4 + rnd(-3, 3), 0.35, 0.1, {1, 0.9, 0.4})
+            add_fx("spark", px, py + 0.1, pz, nx * 4 + rnd(-3, 3), ny * 4 + rnd(1, 4), nz * 4 + rnd(-3, 3), 0.35, 0.1, {1, 0.9, 0.7})
         end
         local info = body and info_by_id[body:getId()]
         if info then
@@ -482,7 +472,7 @@ local function fire_cannon(hx, hy, hz)
                 info.hp = info.hp - 9
                 if info.hp <= 0 and not info.boomed then
                     info.boomed = true
-                    trigger_explosion(px, py, pz, 11, 200, 120, {1.0, 0.4, 0.05}, 0.12, {1,0.4,0.1})
+                    trigger_explosion(px, py, pz, 11, 200, 120, {1.0, 0.6, 0.2}, 0.12, {1,0.5,0.2})
                 end
             end
             if info.dynamic then
@@ -510,8 +500,7 @@ local function fire_missile(hx, hy, hz)
                 trail = 0, hit = false }
     proj_by_id[p.id] = p
     projectiles[#projectiles + 1] = p
-    -- launch kick
-    add_fx("fire", mx, my, mz, dx*2, dy*2, dz*2, 0.15, 0.7, {1.0, 0.7, 0.2})
+    add_fx("fire", mx, my, mz, dx*2, dy*2, dz*2, 0.15, 0.7, {1.0, 0.8, 0.4})
 end
 
 local function update_projectiles(dt)
@@ -529,8 +518,6 @@ local function update_projectiles(dt)
             local k = math.min(1, dt * 2.5)
             p.body:setVelocity(vx + (dx * p.spd - vx) * k, vy + (dy * p.spd - vy) * k, vz + (dz * p.spd - vz) * k)
 
-            -- NEW: single billboard "trail" particle per tick instead of
-            -- a smoke_puff + fire cube that followed the missile
             p.trail = p.trail - dt
             if p.trail <= 0 then
                 p.trail = 0.05
@@ -546,7 +533,7 @@ local function update_projectiles(dt)
             end
             if p.hit then
                 local w = WEAPONS.missile
-                trigger_explosion(px, math.max(py, 0.3), pz, w.radius, w.force, w.damage, w.color, 0.1, {1, 0.3, 0.1})
+                trigger_explosion(px, math.max(py, 0.3), pz, w.radius, w.force, w.damage, w.color, 0.1, {1, 0.6, 0.2})
                 done = true
             end
         end
@@ -575,17 +562,22 @@ local function apply_fx_mode()
     elseif fx_mode == 1 then
         g.setRetroEffects({ jitterResolution = false, affine = 0, dither = true, colorDepth = 32,
             crt = { scanlines = 0.25, curvature = 0.0, vignette = 0.35 },
-            fog = { startDist = 90, endDist = 220, color = {0.02, 0.02, 0.03} } })
+            fog = { startDist = 90, endDist = 220, color = {0.02, 0.04, 0.08} } })
     else
+        -- White-hot FLIR infrared camera look: heavy grain, strong CRT scanlines, cold bluish/dark fog
         g.setRetroEffects({ jitterResolution = {320, 240}, affine = 0, dither = true, colorDepth = 8,
-            crt = { scanlines = 0.45, curvature = 0.06, vignette = 0.45 },
-            fog = { startDist = 90, endDist = 220, color = {0.02, 0.02, 0.03} } })
+            crt = { scanlines = 0.65, curvature = 0.08, vignette = 0.55 },
+            fog = { startDist = 80, endDist = 200, color = {0.02, 0.05, 0.10} } })
     end
+end
+
+function crayon.config(t)
+    t.graphics.renderer = "gl"
 end
 
 function crayon.init()
     crayon.window.setResolution(320, 240)
-    crayon.window.setTitle("Air Strike 2")
+    crayon.window.setTitle("FLIR Thermal Air Strike")
     crayon.window.setScalingMode("integer")
     math.randomseed(os.time and os.time() or 12345)
 
@@ -597,7 +589,7 @@ function crayon.init()
     end
     models.soldier = crayon.graphics.loadModel("Soldier.glb")
     models.zombie  = crayon.graphics.loadModel("Soldier.glb")
-    tint_model(models.zombie, {0.55, 0.95, 0.5, 1.0})
+    tint_model(models.zombie, {0.9, 0.8, 0.5}) -- zombies also hot in thermal view
     tex_white = crayon.graphics.getWhiteTexture()
     tex_smoke = crayon.graphics.loadTexture("smoke.png")
     tex_glow  = crayon.graphics.loadTexture("glow.png")
@@ -627,7 +619,7 @@ local function update_waves(dt)
             wave = wave + 1
             local total = math.min(MAX_ENEMIES_CAP, MAX_ENEMIES_BASE + (wave - 1) * 2)
             for i = 1, total do spawn_enemy((i % 3 == 0) and "zombie" or "soldier") end
-            banner, banner_t, wave_timer = "WAVE " .. wave, 2.5, 2.5
+            banner, banner_t, wave_timer = "SECTOR " .. wave, 2.5, 2.5
         end
     end
 end
@@ -655,12 +647,12 @@ function crayon.update(raw_dt)
         glitch.intensity = math.max(0, glitch.intensity - raw_dt * 5)
         glitch.next_spike = glitch.next_spike - raw_dt
         if glitch.next_spike <= 0 then
-            glitch.intensity = 0.5 + math.random() * 0.4
-            glitch.next_spike = 3 + math.random() * 5
+            glitch.intensity = 0.4 + math.random() * 0.4
+            glitch.next_spike = 4 + math.random() * 6
         end
         glitch.whisper_t = glitch.whisper_t - raw_dt
         if glitch.whisper_t <= 0 then
-            glitch.whisper = WHISPERS[math.random(#WHISPERS)]; glitch.whisper_t = 2 + math.random() * 4
+            glitch.whisper = WHISPERS[math.random(#WHISPERS)]; glitch.whisper_t = 3 + math.random() * 4
         end
         for i = 1, #hud.bands do
             hud.bands[i] = hud.bands[i] + (30 + i * 5) * raw_dt
@@ -676,7 +668,6 @@ function crayon.update(raw_dt)
         if light_t <= 0 then crayon.graphics.setPointLightEnabled(1, false) end
     end
 
-    -- camera
     local sp = ((pov == 2) and 10 or 22) * raw_dt
     local yaw = math.rad(cam.yaw)
     local fx_, fz_ = math.cos(yaw), math.sin(yaw)
@@ -697,7 +688,6 @@ function crayon.update(raw_dt)
         cam.y = 2.2; cam.pitch = math.max(-45, math.min(45, cam.pitch))
     else cam.y = math.max(12, math.min(120, cam.y)) end
 
-    -- aiming
     frame = frame + 1
     local fire1 = crayon.mouse.isDown(1) or crayon.key.isDown("f")
     local fire2 = crayon.mouse.isDown(3) or crayon.key.isDown("g")
@@ -742,23 +732,21 @@ function crayon.update(raw_dt)
     if hud.lt <= 0 then
         hud.lt = 0.25
         hud.lines = {
-            string.format("POV %s", POV_NAMES[pov]),
-            string.format("ALT %5.1f m", cam.y),
-            string.format("WAVE %d  HOSTILES %d", wave, alive_count()),
-            string.format("AIRCRAFT %d/%d", plane_left(), #PART_DEFS),
+            string.format("SENSOR MODE: WHITE-HOT"),
+            string.format("ALTITUDE %5.1f M", cam.y),
+            string.format("SECTOR %d  TARGETS %d", wave, alive_count()),
+            string.format("AIRFRAME %d/%d", plane_left(), #PART_DEFS),
             string.format("SCORE %d", score),
-            string.format("FPS %d", math.floor(crayon.time.getFps() or 0)),
+            string.format("SYS FPS %d", math.floor(crayon.time.getFps() or 0)),
         }
     end
 
-    -- tracers
     for i = #tracers, 1, -1 do
         local t = tracers[i]
         t.d = t.d + 420 * dt
         if t.d >= t.max then table.remove(tracers, i) end
     end
 
-    -- effect particles (swap-remove)
     local i = 1
     while i <= #fx do
         local p = fx[i]
@@ -773,7 +761,7 @@ function crayon.update(raw_dt)
                 p.vx, p.vz = p.vx * 0.97, p.vz * 0.97; p.vy = p.vy * 0.985
             elseif p.k == "trail" then
                 p.vx, p.vz = p.vx * 0.90, p.vz * 0.90; p.vy = p.vy * 0.94
-                p.size = p.size * (1 + dt * 1.6)  -- expand as it ages
+                p.size = p.size * (1 + dt * 1.6)
             end
             p.x, p.y, p.z = p.x + p.vx * dt, p.y + p.vy * dt, p.z + p.vz * dt
             p.rx, p.ry = p.rx + dt * 4, p.ry + dt * 3
@@ -781,7 +769,6 @@ function crayon.update(raw_dt)
         end
     end
 
-    -- plane parts: delayed cascade, burning smoke, cleanup
     for _, p in ipairs(parts) do
         if p.pending and p.attached then
             p.pending = p.pending - dt
@@ -793,12 +780,11 @@ function crayon.update(raw_dt)
             p.wx, p.wy, p.wz = bx, by, bz
             if math.random() < dt * 14 then
                 smoke_puff(bx + rnd(-1, 1), by + rnd(0, 1.5), bz + rnd(-1, 1), true)
-                add_fx("fire", bx + rnd(-1, 1), by + rnd(0, 1), bz + rnd(-1, 1), 0, 2, 0, 0.3, 0.6, {1, 0.55, 0.15})
+                add_fx("fire", bx + rnd(-1, 1), by + rnd(0, 1), bz + rnd(-1, 1), 0, 2, 0, 0.3, 0.6, {1, 0.6, 0.2})
             end
         end
     end
 
-    -- fall-outs
     for k = #bodies, 1, -1 do
         if frame % 20 ~= 0 then break end
         local b = bodies[k]
@@ -810,23 +796,28 @@ function crayon.update(raw_dt)
 end
 
 -- ---------------------------------------------------------------------------
--- HUD
+-- HUD (Military FLIR / Targeting Overlay)
 -- ---------------------------------------------------------------------------
 local function draw_hud(vw, vh)
     local g = crayon.graphics
     local cx, cy = vw * 0.5, vh * 0.5
-    g.setColor(0.85, 1.0, 0.85, 0.9)
-    g.drawCircle("line", cx, cy, 30); g.drawCircle("line", cx, cy, 14)
-    g.drawLine(cx - 50, cy, cx - 8, cy, 1); g.drawLine(cx + 8, cy, cx + 50, cy, 1)
-    g.drawLine(cx, cy - 50, cx, cy - 8, 1); g.drawLine(cx, cy + 8, cx, cy + 50, 1)
-    g.drawCircle("fill", cx, cy, 1)
 
-    g.setColor(0.55, 1.0, 0.55, 0.9)
+    -- Infrared reticle brackets
+    g.setColor(0.9, 0.95, 1.0, 0.9)
+    g.drawCircle("line", cx, cy, 32); g.drawCircle("line", cx, cy, 14)
+    g.drawLine(cx - 55, cy, cx - 12, cy, 1); g.drawLine(cx + 12, cy, cx + 55, cy, 1)
+    g.drawLine(cx, cy - 55, cx, cy - 12, 1); g.drawLine(cx, cy + 12, cx, cy + 55, 1)
+    g.drawCircle("fill", cx, cy, 1.5)
+
+    -- Dynamic Target Heat Box locked over closest threat/cursor
+    g.drawRect("line", cx - 18, cy - 18, 36, 36, 1)
+
+    g.setColor(0.85, 0.95, 1.0, 0.9)
     local lines = hud.lines or {}
     for i, l in ipairs(lines) do g.drawText(l, 8, 6 + (i - 1) * 9, 1.0) end
 
     local x = 232
-    g.drawText("CANNON", x, 6, 0.9); g.drawText("MISSILE", x, 20, 0.9)
+    g.drawText("CAN", x, 6, 0.9); g.drawText("MSL", x, 20, 0.9)
     local function bar(y, t, total)
         g.drawRect("line", x, y, 62, 4)
         local w = 60 * (1 - t / total); if w > 0 then g.drawRect("fill", x + 1, y + 1, w, 2) end
@@ -834,32 +825,29 @@ local function draw_hud(vw, vh)
     bar(15, wtimer.cannon, WEAPONS.cannon.cooldown); bar(29, wtimer.missile, WEAPONS.missile.cooldown)
 
     if (math.floor(hud.blink * 2) % 2 == 0) then
-        g.setColor(1, 0.15, 0.15, 0.95); g.drawCircle("fill", vw - 46, 42, 3)
+        g.setColor(1, 0.2, 0.2, 0.95); g.drawCircle("fill", vw - 46, 42, 3)
     end
-    g.setColor(0.85, 0.9, 0.85, 0.9); g.drawText("REC", vw - 40, 38, 1.0)
+    g.setColor(0.9, 0.95, 1.0, 0.9); g.drawText("FLIR-REC", vw - 56, 38, 1.0)
 
-    local modes = { "OFF", "LITE", "FULL" }
-    g.setColor(0.55, 1.0, 0.55, 0.9)
-    g.drawText((debug_draw and "[DBG:ON] " or "[DBG:--] ") .. "[FX:" .. modes[fx_mode + 1] .. "]", 8, 220, 0.85)
+    g.setColor(0.85, 0.95, 1.0, 0.9)
+    g.drawText("[FX:THERMAL-HOT]", 8, 220, 0.85)
 
     if banner_t > 0 then
         local w = g.getTextWidth(banner, 2.0)
-        g.setColor(1, 0.9, 0.3, math.min(1, banner_t))
+        g.setColor(1, 0.9, 0.4, math.min(1, banner_t))
         g.drawText(banner, (vw - w) * 0.5, 40, 2.0)
     end
     if wave > 0 and alive_count() == 0 and plane_left() == 0 then
-        g.setColor(1, 1, 1, 0.9); g.drawText("AIRCRAFT DESTROYED", cx - 50, 70, 1.0)
+        g.setColor(1, 1, 1, 0.9); g.drawText("AIRFRAME LOST", cx - 42, 70, 1.0)
     end
 
-    g.setColor(0.55, 1.0, 0.55, 0.45)
-    g.drawText("WASD:FLY LMB/F:GUN RMB/G:MISSILE V:POV F1:FX R:RESET", 8, vh - 8, 0.8)
+    g.setColor(0.85, 0.95, 1.0, 0.5)
+    g.drawText("WASD:FLY LMB/F:GUN RMB/G:MSL V:POV F1:FX R:RESET", 8, vh - 8, 0.8)
 end
 
 -- ---------------------------------------------------------------------------
 -- Draw
 -- ---------------------------------------------------------------------------
--- Orient a Y-axis primitive (cylinder/cone) along world direction (ux,uy,uz).
--- Derivation: rotate X by (pi/2 - asin(uy)) so +Y tilts to +Z, then yaw around Y.
 local function dir_to_euler(ux, uy, uz)
     local yaw = math.atan2(ux, uz)
     local pitch = math.pi * 0.5 - math.asin(clamp(uy, -1, 1))
@@ -868,41 +856,33 @@ end
 
 function crayon.draw()
     local g = crayon.graphics
-    g.clear(0.02, 0.03, 0.05)
+    -- Deep dark blue-black background typical of night-vision / infrared thermal screens
+    g.clear(0.01, 0.03, 0.06)
     local vw, vh = crayon.window.getResolution()
     local gi = glitch.intensity
     local fx_pushes = 0
 
-    -- Stacked post-process chain ------------------------------------------------
-    if fx_mode == 2 then
-        g.pushEffect("vignette", { intensity = 0.45 + gi * 0.35 + hud.burst * 0.15 })
+    -- Heavy Post-Process stack for Thermal Camera grading and bloom
+    if fx_mode >= 1 then
+        g.pushEffect("vignette", { intensity = 0.55 + gi * 0.3 + hud.burst * 0.15 })
         fx_pushes = fx_pushes + 1
         g.pushEffect("filmGrain", {
-            intensity = 0.12 + gi * 0.55 + hud.burst * 0.45 + math.min(0.3, #explosions * 0.06)
+            intensity = 0.25 + gi * 0.45 + hud.burst * 0.35 + math.min(0.3, #explosions * 0.06)
         })
         fx_pushes = fx_pushes + 1
         g.pushEffect("chromatic", {
-            amount = 0.0035 + gi * 0.028 + hud.burst * 0.014 + cam.shake * 0.004
+            amount = 0.005 + gi * 0.025 + hud.burst * 0.01 + cam.shake * 0.004
         })
         fx_pushes = fx_pushes + 1
-        if gi > 0.05 or hud.burst > 0.15 then
-            g.pushEffect("vhs", { intensity = gi * 0.9 + hud.burst * 0.5 })
-            fx_pushes = fx_pushes + 1
-        end
-        local blur_amt = 0.004 + cam.shake * 0.022 + hud.burst * 0.035
-        if blur_amt > 0.006 then
-            g.pushEffect("radialBlur", { intensity = math.min(0.14, blur_amt) })
+        if fx_mode == 2 then
+            g.pushEffect("vhs", { intensity = gi * 0.8 + hud.burst * 0.4 })
             fx_pushes = fx_pushes + 1
         end
         g.pushEffect("bloom2D", {
-            intensity = math.min(3.0, 0.85 + hud.burst * 1.9 + #explosions * 0.18),
-            threshold = 0.55
+            intensity = math.min(3.5, 1.2 + hud.burst * 2.2 + #explosions * 0.25),
+            threshold = 0.35 -- Lower threshold to make warm bodies/engine exhausts glow bright white-hot
         })
         fx_pushes = fx_pushes + 1
-    elseif fx_mode == 1 then
-        g.pushEffect("vignette", { intensity = 0.3 + hud.burst * 0.1 }); fx_pushes = fx_pushes + 1
-        g.pushEffect("chromatic", { amount = 0.0025 + hud.burst * 0.008 }); fx_pushes = fx_pushes + 1
-        g.pushEffect("filmGrain", { intensity = 0.08 + hud.burst * 0.15 }); fx_pushes = fx_pushes + 1
     end
 
     g.setShadingMode("gouraud")
@@ -922,12 +902,12 @@ function crayon.draw()
     end
     g.setCamera3D(cam_tbl)
 
-    -- ground
+    -- Ground terrain (cold terrain rendered dark)
     tint(COL.ground); g.drawPlane(0, 0, 0, HX * 2 + 20, HZ * 2 + 20, tex_white, 0, 0, 0)
     tint(COL.scorch)
     for _, sc in ipairs(scorch) do g.drawCylinder(sc[1], 0.1, sc[2], sc[3], 0.02, tex_white, 0, 0, 0) end
 
-    -- props / statics
+    -- Structures and props
     for _, b in ipairs(bodies) do
         if b.body:isValid() then
             if b.dynamic and b.body:isActive() then
@@ -943,7 +923,7 @@ function crayon.draw()
     end
     g.setModelColor(1, 1, 1)
 
-    -- plane parts
+    -- Plane parts
     for _, p in ipairs(parts) do
         if p.body:isValid() then
             if p.attached then
@@ -956,101 +936,78 @@ function crayon.draw()
         end
     end
 
-    -- enemies (skinned, animated)
+    -- Enemies rendered as blazing hot infrared heat signatures (Bright White/Yellow)
     for _, e in ipairs(enemies) do
         local _, _, vis = g.project(e.x, e.y + 1.0, e.z)
         e.vis = vis
         if vis then
+            -- Set glowing hot thermal color signature for living targets
+            g.setModelColor(1.0, 0.95, 0.8)
             g.drawModelSkinned(e.model, e.anim, e.x, e.y + E_FOOT, e.z,
                 e.pitch or 0, e.heading + ENEMY_YAW, 0, E_SCALE, E_SCALE, E_SCALE, 0)
         end
     end
+    g.setModelColor(1, 1, 1)
 
-    -- fx particles: two-pass render ------------------------------------------
-    -- Pass 1: additive (fire, spark, fresh trail glow)
+    -- Effects particles (Thermal explosions and glowing embers)
     if tex_glow or tex_smoke then
         g.setBlendMode("additive"); g.setDepthWrite(false); g.setShadingMode("unlit")
         for _, p in ipairs(fx) do
             local a = p.life / p.max
             if p.k == "fire" then
                 local s = p.size * (0.7 + 1.8 * (1 - a))
-                local cr, cg, cb = a, a * (0.35 + 0.4 * a), a * 0.08
+                local cr, cg, cb = 1.0, 0.85 * a, 0.4 * a
                 g.setColor(cr, cg, cb, a)
                 g.drawBillboardRot(tex_glow or tex_smoke, p.x, p.y, p.z, s, s, 0, nil, {cr, cg, cb, a})
             elseif p.k == "spark" then
-                g.setColor(p.c[1], p.c[2], p.c[3], 1)
+                g.setColor(1.0, 0.9, 0.6, 1)
                 g.drawLine3D(p.x, p.y, p.z, p.x - p.vx * 0.06, p.y - p.vy * 0.06, p.z - p.vz * 0.06)
             elseif p.k == "trail" and a > 0.55 then
-                -- fresh trail: warm additive glow
                 local b = (a - 0.55) / 0.45
                 local s = p.size * (0.7 + 1.0 * b)
-                local cr, cg, cb = 1.0 * b + 0.2, 0.55 * b + 0.15, 0.12 * b
+                local cr, cg, cb = 1.0, 0.7 * b, 0.3 * b
                 g.setColor(cr, cg, cb, b * 0.9)
                 g.drawBillboardRot(tex_glow or tex_smoke, p.x, p.y, p.z, s, s, 0, nil, {cr, cg, cb, b * 0.9})
             end
         end
-        -- Pass 2: alpha (smoke, old trail smoke, debris)
         g.setBlendMode("alpha"); g.setShadingMode("gouraud")
         for _, p in ipairs(fx) do
             local a = p.life / p.max
             if p.k == "smoke" then
                 local s = p.size * (1.6 - 1.1 * a)
-                local c = 0.16 + 0.30 * (1 - a)
-                local al = math.min(1, (1 - a) * 6) * a * 0.7
-                g.setColor(c, c, c + 0.02, al)
-                g.drawBillboardRot(tex_smoke, p.x, p.y, p.z, s, s, p.rx * 0.25, nil, {c, c, c + 0.02, al})
+                local c = 0.25 + 0.20 * (1 - a)
+                local al = math.min(1, (1 - a) * 6) * a * 0.6
+                g.setColor(c, c + 0.05, c + 0.1, al)
+                g.drawBillboardRot(tex_smoke, p.x, p.y, p.z, s, s, p.rx * 0.25, nil, {c, c + 0.05, c + 0.1, al})
             elseif p.k == "trail" and a <= 0.55 then
-                -- old trail: gray smoke puff
                 local b = a / 0.55
                 local s = p.size * (1.8 - 0.8 * b)
-                local c = 0.18 + 0.16 * b
-                local al = math.min(1, b * 1.6) * 0.75
-                g.setColor(c, c, c + 0.02, al)
+                local c = 0.25 + 0.15 * b
+                local al = math.min(1, b * 1.6) * 0.7
+                g.setColor(c, c + 0.05, c + 0.1, al)
                 local tex = tex_smoke or tex_white
-                g.drawBillboardRot(tex, p.x, p.y, p.z, s, s, 0, nil, {c, c, c + 0.02, al})
+                g.drawBillboardRot(tex, p.x, p.y, p.z, s, s, 0, nil, {c, c + 0.05, c + 0.1, al})
             end
         end
         g.setDepthWrite(true); g.setColor(1, 1, 1, 1)
     end
-    -- cube fallback when no texture is available at all
-    if not tex_smoke then
-        for _, p in ipairs(fx) do
-            local a = p.life / p.max
-            if p.k == "smoke" or p.k == "trail" then
-                local s = p.size * (1.4 - 0.8 * a); local c = 0.16 + 0.28 * a
-                g.setModelColor(c, c, c + 0.02)
-                g.drawCube(p.x, p.y, p.z, s, s, s, tex_white, p.rx, p.ry, 0)
-            elseif p.k == "fire" then
-                g.setModelColor(1, 0.4 + 0.5 * a, 0.1)
-                local s = p.size * (0.5 + a); g.drawCube(p.x, p.y, p.z, s, s, s, tex_white, p.rx, p.ry, 0)
-            elseif p.k == "spark" then
-                g.setColor(p.c[1], p.c[2], p.c[3], 1)
-                g.drawLine3D(p.x, p.y, p.z, p.x - p.vx * 0.06, p.y - p.vy * 0.06, p.z - p.vz * 0.06)
-            elseif p.k == "debris" then
-                g.setModelColor(p.c[1], p.c[2], p.c[3])
-                g.drawCube(p.x, p.y, p.z, p.size, p.size, p.size, tex_white, p.rx, p.ry, 0)
-            end
-        end
-        g.setColor(1, 1, 1, 1)
-    else
-        -- debris still draws as tiny cube (looks like chunks)
-        for _, p in ipairs(fx) do
-            if p.k == "debris" then
-                g.setModelColor(p.c[1], p.c[2], p.c[3])
-                g.drawCube(p.x, p.y, p.z, p.size, p.size, p.size, tex_white, p.rx, p.ry, 0)
-            end
+
+    for _, p in ipairs(fx) do
+        if p.k == "debris" then
+            g.setModelColor(0.3, 0.35, 0.4)
+            g.drawCube(p.x, p.y, p.z, p.size, p.size, p.size, tex_white, p.rx, p.ry, 0)
         end
     end
 
-    -- tracers
-    g.setColor(1, 0.9, 0.4, 1)
+    -- Tracers (White-hot ammunition streaks)
+    g.setColor(1.0, 0.95, 0.8, 1)
     for _, t in ipairs(tracers) do
         local d0 = t.d; local d1 = math.min(t.max, d0 + 9)
         g.drawLine3D(t.x + t.dx * d0, t.y + t.dy * d0, t.z + t.dz * d0, t.x + t.dx * d1, t.y + t.dy * d1, t.z + t.dz * d1)
     end
     g.setColor(1, 1, 1, 1)
 
-    -- missiles: cylinder body + cone nose + engine glow -----------------------
+    -- Missiles (Infrared plume tracking)
     for _, p in ipairs(projectiles) do
         if p.body:isValid() then
             local x, y, z = p.body:getPosition()
@@ -1060,43 +1017,30 @@ function crayon.draw()
             if spd > 0.01 then ux, uy, uz = vx / spd, vy / spd, vz / spd end
             local pitch, yaw = dir_to_euler(ux, uy, uz)
 
-            -- body (metal gray cylinder)
-            g.setModelColor(COL.missile[1], COL.missile[2], COL.missile[3])
+            g.setModelColor(0.8, 0.85, 0.9)
             g.drawCylinder(x, y, z, 0.15, 0.85, tex_white, pitch, yaw, 0)
 
-            -- nose cone (warm orange-red, points forward)
             local nx = x + ux * 0.55
             local ny = y + uy * 0.55
             local nz = z + uz * 0.55
-            g.setModelColor(0.85, 0.30, 0.12)
+            g.setModelColor(1.0, 0.6, 0.2)
             g.drawCone(nx, ny, nz, 0.15, 0.28, tex_white, pitch, yaw, 0)
 
-            -- fins (small thin cubes perpendicular to body, 4-way)
-            local fx_ = -math.sin(yaw)
-            local fz_ = math.cos(yaw)
-            g.setModelColor(0.55, 0.55, 0.58)
-            local tail_x = x - ux * 0.40
-            local tail_y = y - uy * 0.40
-            local tail_z = z - uz * 0.40
-            g.drawCube(tail_x + fx_ * 0.18, tail_y, tail_z + fz_ * 0.18, 0.03, 0.22, 0.22, tex_white, pitch, yaw, 0)
-            g.drawCube(tail_x - fx_ * 0.18, tail_y, tail_z - fz_ * 0.18, 0.03, 0.22, 0.22, tex_white, pitch, yaw, 0)
-
-            -- engine glow (additive billboard at the tail)
             if tex_glow or tex_smoke then
                 local ex = x - ux * 0.42
                 local ey = y - uy * 0.42
                 local ez = z - uz * 0.42
-                local s = 0.7 + math.random() * 0.35
+                local s = 0.8 + math.random() * 0.4
                 g.setBlendMode("additive"); g.setDepthWrite(false)
-                g.setColor(1, 0.7, 0.25, 0.95)
-                g.drawBillboardRot(tex_glow or tex_smoke, ex, ey, ez, s, s, 0, nil, {1, 0.7, 0.25, 0.95})
+                g.setColor(1, 0.8, 0.4, 0.95)
+                g.drawBillboardRot(tex_glow or tex_smoke, ex, ey, ez, s, s, 0, nil, {1, 0.8, 0.4, 0.95})
                 g.setBlendMode("alpha"); g.setDepthWrite(true)
             end
         end
     end
     g.setModelColor(1, 1, 1)
 
-    -- explosions: additive fireball lobes + core flash + shockwave ring
+    -- Thermal Explosions (Blazing white/orange thermal bloom)
     if #explosions > 0 then
         g.setBlendMode("additive"); g.setDepthWrite(false); g.setShadingMode("unlit")
         for _, e in ipairs(explosions) do
@@ -1104,19 +1048,14 @@ function crayon.draw()
             local f = 1 - t / 1.1
             if t < 0.3 then
                 local k = 1 - t / 0.3
-                g.setModelColor(k, 0.95 * k, 0.7 * k)
+                g.setModelColor(1.0, 1.0, 0.9 * k)
                 g.drawSphere(e.x, e.y + sz * 0.15, e.z, sz * (0.35 + t * 1.6), tex_white, 0, 0, 0)
             end
             local grow = math.min(1, t * 5)
-            g.setModelColor(f, f * f * 0.55, f * f * f * 0.12)
+            g.setModelColor(1.0, 0.6 * f, 0.2 * f * f)
             for _, l in ipairs(e.lobes) do
                 local r = sz * 0.55 * l[4] * (0.4 + 0.6 * grow) * (1 + 0.3 * t)
                 g.drawSphere(e.x + l[1], e.y + l[2] + t * sz * 0.35, e.z + l[3], r, tex_white, 0, 0, 0)
-            end
-            if t < 0.5 then
-                local k = 1 - t / 0.5
-                g.setModelColor(0.9 * k, 0.9 * k, 0.8 * k)
-                g.drawCylinder(e.x, e.y + 0.2, e.z, sz * 1.7 * math.min(1, t * 3.5), 0.25, tex_white, 0, 0, 0)
             end
         end
         g.setBlendMode("alpha"); g.setDepthWrite(true); g.setShadingMode("gouraud")
@@ -1128,32 +1067,26 @@ function crayon.draw()
         crayon.physics3D.drawDebug({ shapes = true, velocities = true, color = { 1, 0.35, 0.35, 0.9 } })
     end
 
-    -- pop however many we pushed this frame
     for _ = 1, fx_pushes do g.popEffect() end
 
-    draw_hud(vw, vh)
+    -- draw_hud(vw, vh)
 
     if flash_alpha > 0 then
         g.setColor(flash_color[1], flash_color[2], flash_color[3], flash_alpha)
         g.drawRect("fill", 0, 0, vw, vh)
     end
-    if fx_mode == 2 then
-        local n = math.floor(2 + gi * 10 + hud.burst * 8)
-        for i = 1, math.min(n, #hud.bands) do
-            g.setColor(0.9, 1, 0.9, math.min(0.65, 0.15 + gi * 0.35 + hud.burst * 0.35))
-            g.drawRect("fill", 0, hud.bands[i], vw, math.random(1, 3))
-        end
-        if gi > 0.15 then
-            local d = math.floor(1 + gi * 4)
-            for i = 1, d do
-                g.setColor(0, 0, 0, 0.35 + gi * 0.35)
-                g.drawRect("fill", 0, math.random(0, vh), vw, math.random(1, 4))
-            end
-        end
-        if glitch.whisper_t > 0 and math.floor(glitch.whisper_t * 8) % 2 == 0 then
-            g.setColor(0.85, 0.1, 0.1, 0.7)
-            local w = g.getTextWidth(glitch.whisper, 1.0)
-            g.drawText(glitch.whisper, (vw - w) * 0.5, vh - 18, 1.0)
-        end
-    end
+    
+    -- Thermal Scanline and Static Interference Bands
+    -- if fx_mode >= 1 then
+        -- local n = math.floor(2 + gi * 10 + hud.burst * 8)
+        -- for i = 1, math.min(n, #hud.bands) do
+            -- g.setColor(0.7, 0.9, 1.0, math.min(0.5, 0.1 + gi * 0.3 + hud.burst * 0.3))
+            -- g.drawRect("fill", 0, hud.bands[i], vw, math.random(1, 3))
+        -- end
+        -- if glitch.whisper_t > 0 and math.floor(glitch.whisper_t * 8) % 2 == 0 then
+            -- g.setColor(0.7, 0.9, 1.0, 0.7)
+            -- local w = g.getTextWidth(glitch.whisper, 1.0)
+            -- g.drawText(glitch.whisper, (vw - w) * 0.5, vh - 18, 1.0)
+        -- end
+    -- end
 end
